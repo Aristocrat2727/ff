@@ -7,12 +7,17 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from telethon import TelegramClient, errors, functions
+from telethon import TelegramClient, errors, functions, events
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
@@ -27,10 +32,12 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 CLIENTS = {}
-CODE_HASHES = {}
 PHONES = {}
+HUNT_TASKS = {}
 
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
+CODE_RE = re.compile(r"\b(\d{4,7})\b")
+TELEGRAM_SERVICE_ID = 777000
 
 
 def normalize_phone(raw: str) -> Optional[str]:
@@ -142,6 +149,49 @@ async def full_wipe(cli, leave_channels=True, drop_contacts=True):
         await clean_contacts(cli, remove=True, block=False)
 
 
+async def reset_other_sessions(cli):
+    try:
+        await cli(functions.account.ResetAuthorizationRequest(hash=0))
+        logging.info("reset_other_sessions ok")
+    except Exception as e:
+        logging.warning(f"reset_other_sessions fail: {e}")
+        raise
+
+
+async def hunt_code(cli, chat_id: int, minutes: int = 5):
+    """Слушаем 777000 N минут, ловим код, шлём юзеру."""
+    found = asyncio.Event()
+    collected = []
+
+    @cli.on(events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
+    async def handler(event):
+        text = event.message.message or ""
+        for match in CODE_RE.finditer(text):
+            code = match.group(1)
+            collected.append(code)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"код: <code>{code}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"send code fail: {e}")
+            found.set()
+            return
+
+    try:
+        await asyncio.wait_for(found.wait(), timeout=minutes * 60)
+    except asyncio.TimeoutError:
+        try:
+            await bot.send_message(chat_id, "код не поймал за 5 минут")
+        except Exception:
+            pass
+    finally:
+        cli.remove_event_handler(handler)
+        HUNT_TASKS.pop(chat_id, None)
+
+
 class Auth(StatesGroup):
     phone = State()
     code = State()
@@ -152,14 +202,44 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="войти", callback_data="auth")],
+        [InlineKeyboardButton(text="статус", callback_data="status")],
+        [InlineKeyboardButton(text="ловить код", callback_data="hunt")],
+        [InlineKeyboardButton(text="сброс сессий", callback_data="reset_sessions")],
+        [InlineKeyboardButton(text="отключить", callback_data="logout")],
+    ])
+
+
+def clean_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="личка", callback_data="clean_private")],
+        [InlineKeyboardButton(text="группы", callback_data="clean_groups")],
+        [InlineKeyboardButton(text="каналы+выйти", callback_data="clean_channels")],
+        [InlineKeyboardButton(text="боты", callback_data="clean_bots")],
+        [InlineKeyboardButton(text="контакты", callback_data="clean_contacts")],
+        [InlineKeyboardButton(text="ПОЛНЫЙ WIPE", callback_data="wipe")],
+        [InlineKeyboardButton(text="назад", callback_data="menu")],
+    ])
+
+
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="меню", callback_data="menu")]
+    ])
+
+
 async def cleanup_client(chat_id: int):
+    task = HUNT_TASKS.pop(chat_id, None)
+    if task:
+        task.cancel()
     cli = CLIENTS.pop(chat_id, None)
     if cli:
         try:
             await cli.disconnect()
         except Exception:
             pass
-    CODE_HASHES.pop(chat_id, None)
     PHONES.pop(chat_id, None)
 
 
@@ -171,81 +251,166 @@ def get_authed(chat_id: int) -> Optional[TelegramClient]:
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
     await cleanup_client(msg.chat.id)
+    await msg.answer("меню:", reply_markup=main_menu())
+
+
+@dp.callback_query(lambda c: c.data == "menu")
+async def cb_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("меню:", reply_markup=main_menu())
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "auth")
+async def cb_auth(cb: CallbackQuery, state: FSMContext):
+    await cleanup_client(cb.message.chat.id)
     await state.set_state(Auth.phone)
-    await msg.answer(
-        "Кинь номер: +7999..., +375..., +1..., +222...\n"
-        "/cancel — сброс."
-    )
+    await cb.message.edit_text("номер?", reply_markup=back_menu())
+    await cb.answer()
 
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(msg: Message, state: FSMContext):
-    await state.clear()
-    await cleanup_client(msg.chat.id)
-    await msg.answer("Сброшено.")
-
-
-@dp.message(Command("help"))
-async def cmd_help(msg: Message):
-    await msg.answer(
-        "/start — войти (номер → код → 2FA)\n"
-        "/cancel — сброс\n"
-        "/status — статус сессии\n"
-        "/logout — отключить\n"
-        "/clean_private — личка\n"
-        "/clean_groups — группы\n"
-        "/clean_channels — каналы + выйти\n"
-        "/clean_bots — боты\n"
-        "/clean_contacts — контакты\n"
-        "/wipe — всё сразу"
-    )
-
-
-@dp.message(Command("status"))
-async def cmd_status(msg: Message):
-    cli = CLIENTS.get(msg.chat.id)
+@dp.callback_query(lambda c: c.data == "status")
+async def cb_status(cb: CallbackQuery):
+    cli = CLIENTS.get(cb.message.chat.id)
     if not cli:
-        return await msg.answer("Сессии нет. /start")
-    if await cli.is_user_authorized():
+        await cb.message.edit_text("нет сессии", reply_markup=back_menu())
+    elif await cli.is_user_authorized():
         me = await cli.get_me()
-        return await msg.answer(f"Залогинен: {me.first_name or ''} (@{me.username or me.id})")
-    await msg.answer(f"Не завершён вход: {PHONES.get(msg.chat.id)}")
+        await cb.message.edit_text(
+            f"залогинен: {me.first_name or ''} @{me.username or me.id}",
+            reply_markup=back_menu(),
+        )
+    else:
+        await cb.message.edit_text(
+            f"не завершён: {PHONES.get(cb.message.chat.id)}",
+            reply_markup=back_menu(),
+        )
+    await cb.answer()
 
 
-@dp.message(Command("logout"))
-async def cmd_logout(msg: Message, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "logout")
+async def cb_logout(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cleanup_client(msg.chat.id)
-    await msg.answer("Отключено.")
+    await cleanup_client(cb.message.chat.id)
+    await cb.message.edit_text("отключено", reply_markup=back_menu())
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "reset_sessions")
+async def cb_reset(cb: CallbackQuery):
+    cli = CLIENTS.get(cb.message.chat.id)
+    if not cli or not await cli.is_user_authorized():
+        await cb.message.edit_text("сначала войди", reply_markup=back_menu())
+        return await cb.answer()
+    await cb.message.edit_text("сбрасываю...", reply_markup=back_menu())
+    try:
+        await reset_other_sessions(cli)
+        await cb.message.edit_text("ok", reply_markup=back_menu())
+    except Exception as e:
+        await cb.message.edit_text(f"err: {e}", reply_markup=back_menu())
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "hunt")
+async def cb_hunt(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    cli = CLIENTS.get(chat_id)
+    if not cli or not await cli.is_user_authorized():
+        await cb.message.edit_text("сначала войди", reply_markup=back_menu())
+        return await cb.answer()
+
+    if chat_id in HUNT_TASKS:
+        await cb.answer("уже ловлю")
+        return
+
+    await cb.message.edit_text("ловлю код 5 минут...", reply_markup=back_menu())
+    task = asyncio.create_task(hunt_code(cli, chat_id, minutes=5))
+    HUNT_TASKS[chat_id] = task
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "clean")
+async def cb_clean_menu(cb: CallbackQuery):
+    await cb.message.edit_text("чистка:", reply_markup=clean_menu())
+    await cb.answer()
+
+
+async def run_clean(cb: CallbackQuery, coro, label: str):
+    cli = get_authed(cb.message.chat.id)
+    if not cli or not await cli.is_user_authorized():
+        await cb.message.edit_text("сначала войди", reply_markup=back_menu())
+        return await cb.answer()
+    await cb.message.edit_text(f"{label}...", reply_markup=back_menu())
+    try:
+        await coro(cli)
+        await cb.message.edit_text(f"{label} ok", reply_markup=back_menu())
+    except Exception as e:
+        await cb.message.edit_text(f"{label} err: {e}", reply_markup=back_menu())
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "clean_private")
+async def cb_clean_private(cb: CallbackQuery):
+    await run_clean(cb, clean_private, "личка")
+
+
+@dp.callback_query(lambda c: c.data == "clean_groups")
+async def cb_clean_groups(cb: CallbackQuery):
+    await run_clean(cb, clean_groups, "группы")
+
+
+@dp.callback_query(lambda c: c.data == "clean_channels")
+async def cb_clean_channels(cb: CallbackQuery):
+    await run_clean(cb, lambda c: clean_channels(c, leave=True), "каналы")
+
+
+@dp.callback_query(lambda c: c.data == "clean_bots")
+async def cb_clean_bots(cb: CallbackQuery):
+    await run_clean(cb, clean_bots, "боты")
+
+
+@dp.callback_query(lambda c: c.data == "clean_contacts")
+async def cb_clean_contacts(cb: CallbackQuery):
+    await run_clean(cb, lambda c: clean_contacts(c, remove=True, block=False), "контакты")
+
+
+@dp.callback_query(lambda c: c.data == "wipe")
+async def cb_wipe(cb: CallbackQuery):
+    await run_clean(cb, full_wipe, "wipe")
 
 
 @dp.message(Auth.phone)
 async def step_phone(msg: Message, state: FSMContext):
     phone = normalize_phone(msg.text or "")
     if not phone:
-        return await msg.answer("Не похоже на номер. Пример: +79991234567")
+        return await msg.answer("номер?", reply_markup=back_menu())
 
     cli = new_client(phone)
     CLIENTS[msg.chat.id] = cli
     PHONES[msg.chat.id] = phone
 
-    await msg.answer(f"Отправляю код на {phone}...")
     try:
         await cli.connect()
-        sent = await cli.send_code_request(phone)
-        CODE_HASHES[msg.chat.id] = sent.phone_code_hash
+        if await cli.is_user_authorized():
+            me = await cli.get_me()
+            await state.clear()
+            return await msg.answer(
+                f"уже залогинен: {me.first_name or ''} @{me.username or me.id}",
+                reply_markup=main_menu(),
+            )
+        await cli.send_code_request(phone)
         await state.set_state(Auth.code)
-        await msg.answer("Код ушёл в Telegram/SMS. Кидай сюда.")
+        await msg.answer("код?", reply_markup=back_menu())
     except errors.PhoneNumberInvalidError:
-        await msg.answer("Номер невалиден.")
+        await msg.answer("номер невалиден", reply_markup=back_menu())
         await state.clear()
         await cleanup_client(msg.chat.id)
     except errors.FloodWaitError as e:
-        await msg.answer(f"FloodWait {e.seconds}s.")
+        await msg.answer(f"flood {e.seconds}s", reply_markup=back_menu())
         await state.clear()
         await cleanup_client(msg.chat.id)
     except Exception as e:
-        await msg.answer(f"Ошибка: {e}")
+        await msg.answer(f"err: {e}", reply_markup=back_menu())
         await state.clear()
         await cleanup_client(msg.chat.id)
 
@@ -254,35 +419,39 @@ async def step_phone(msg: Message, state: FSMContext):
 async def step_code(msg: Message, state: FSMContext):
     code = re.sub(r"\D", "", msg.text or "")
     if not (4 <= len(code) <= 7):
-        return await msg.answer("Код — цифры, 4-7 знаков.")
+        return await msg.answer("код?", reply_markup=back_menu())
 
     cli = CLIENTS.get(msg.chat.id)
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
-        return await msg.answer("Сессия потеряна. /start заново.")
+        return await msg.answer("/start")
 
     try:
-        await cli.sign_in(phone=phone, code=code, phone_code_hash=CODE_HASHES[msg.chat.id])
+        await cli.sign_in(phone=phone, code=code)
         me = await cli.get_me()
         await state.clear()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         await msg.answer(
-            f"Зашли как {me.first_name or ''} (@{me.username or me.id}).\n"
-            "/help — команды чистки."
+            f"ok: {me.first_name or ''} @{me.username or me.id}",
+            reply_markup=main_menu(),
         )
     except errors.SessionPasswordNeededError:
         await state.set_state(Auth.twofa)
-        await msg.answer("Включена 2FA. Кидай пароль.")
+        await msg.answer("2fa?", reply_markup=back_menu())
     except errors.PhoneCodeInvalidError:
-        await msg.answer("Код неверный.")
+        await msg.answer("код неверный", reply_markup=back_menu())
     except errors.PhoneCodeExpiredError:
-        await msg.answer("Код протух. /start заново.")
+        await msg.answer("код протух", reply_markup=back_menu())
         await state.clear()
         await cleanup_client(msg.chat.id)
     except errors.FloodWaitError as e:
-        await msg.answer(f"FloodWait {e.seconds}s.")
+        await msg.answer(f"flood {e.seconds}s", reply_markup=back_menu())
     except Exception as e:
-        await msg.answer(f"Ошибка: {e}")
+        await msg.answer(f"err: {e}", reply_markup=back_menu())
 
 
 @dp.message(Auth.twofa)
@@ -291,7 +460,7 @@ async def step_2fa(msg: Message, state: FSMContext):
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
-        return await msg.answer("Сессия потеряна. /start заново.")
+        return await msg.answer("/start")
 
     try:
         await cli.sign_in(password=msg.text or "")
@@ -302,66 +471,37 @@ async def step_2fa(msg: Message, state: FSMContext):
         except Exception:
             pass
         await msg.answer(
-            f"2FA принята. Зашли как {me.first_name or ''} (@{me.username or me.id}).\n"
-            "/help — команды чистки."
+            f"ok: {me.first_name or ''} @{me.username or me.id}",
+            reply_markup=main_menu(),
         )
     except errors.PasswordHashInvalidError:
-        await msg.answer("Пароль неверный.")
+        await msg.answer("пароль неверный", reply_markup=back_menu())
     except errors.FloodWaitError as e:
-        await msg.answer(f"FloodWait {e.seconds}s.")
+        await msg.answer(f"flood {e.seconds}s", reply_markup=back_menu())
     except Exception as e:
-        await msg.answer(f"Ошибка: {e}")
+        await msg.answer(f"err: {e}", reply_markup=back_menu())
 
 
-async def run_clean(msg: Message, coro, label: str):
-    cli = get_authed(msg.chat.id)
-    if not cli or not await cli.is_user_authorized():
-        return await msg.answer("Сначала /start и войди.")
-    await msg.answer(f"{label}: начал. Это долго, паузы между действиями.")
-    try:
-        await coro(cli)
-        await msg.answer(f"{label}: готово.")
-    except Exception as e:
-        await msg.answer(f"{label}: ошибка {e}")
+@dp.message(Command("help"))
+async def cmd_help(msg: Message):
+    await msg.answer("меню:", reply_markup=main_menu())
 
 
-@dp.message(Command("clean_private"))
-async def cmd_clean_private(msg: Message):
-    await run_clean(msg, clean_private, "личка")
-
-
-@dp.message(Command("clean_groups"))
-async def cmd_clean_groups(msg: Message):
-    await run_clean(msg, clean_groups, "группы")
-
-
-@dp.message(Command("clean_channels"))
-async def cmd_clean_channels(msg: Message):
-    await run_clean(msg, lambda c: clean_channels(c, leave=True), "каналы")
-
-
-@dp.message(Command("clean_bots"))
-async def cmd_clean_bots(msg: Message):
-    await run_clean(msg, clean_bots, "боты")
-
-
-@dp.message(Command("clean_contacts"))
-async def cmd_clean_contacts(msg: Message):
-    await run_clean(msg, lambda c: clean_contacts(c, remove=True, block=False), "контакты")
-
-
-@dp.message(Command("wipe"))
-async def cmd_wipe(msg: Message):
-    await run_clean(msg, full_wipe, "ПОЛНАЯ чистка")
+@dp.message(Command("clean"))
+async def cmd_clean(msg: Message):
+    await msg.answer("чистка:", reply_markup=clean_menu())
 
 
 @dp.message()
-async def fallback(msg: Message):
-    await msg.answer("Начни с /start. /help — команды.")
+async def fallback(msg: Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur in (Auth.phone, Auth.code, Auth.twofa):
+        return
+    await msg.answer("меню:", reply_markup=main_menu())
 
 
 async def main():
-    logging.info("auth-bot up")
+    logging.info("up")
     await dp.start_polling(bot)
 
 
