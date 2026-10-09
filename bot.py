@@ -1,5 +1,5 @@
 # language: Python, file: authbot_aiogram.py
-# aiogram 3.x front + Telethon backend: phone -> code -> 2FA, multi-country
+# aiogram 3.x front + Telethon backend, Railway env vars, no .env file
 
 import os
 import re
@@ -7,8 +7,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.fsm.state import State, StatesGroup
@@ -17,39 +16,40 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, errors
 
-load_dotenv()
+# ---------- env (Railway → Variables) ----------
 
-BOT_TOKEN    = os.getenv("BOT_TOKEN")
-API_ID       = int(os.getenv("API_ID", "0"))
-API_HASH     = os.getenv("API_HASH")
+def _req(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise SystemExit(f"env {name} не задан. Добавь в Railway → Variables.")
+    return v
+
+BOT_TOKEN    = _req("BOT_TOKEN")
+API_ID       = int(_req("API_ID"))
+API_HASH     = _req("API_HASH")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "./sessions")
-ADMIN_IDS    = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-
-if not all([BOT_TOKEN, API_ID, API_HASH]):
-    raise SystemExit("BOT_TOKEN / API_ID / API_HASH не заданы в .env")
+ADMIN_IDS    = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+}
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-# ---- Telethon-клиенты по chat_id: {chat_id: TelegramClient} ----
-CLIENTS: dict[int, TelegramClient] = {}
-# ---- phone_code_hash по chat_id ----
-CODE_HASHES: dict[int, str] = {}
-# ---- телефон по chat_id (для финального отчёта) ----
-PHONES: dict[int, str] = {}
+# ---------- state ----------
+
+CLIENTS:     dict[int, TelegramClient] = {}
+CODE_HASHES: dict[int, str]            = {}
+PHONES:      dict[int, str]            = {}
 
 
-# ---------- нормализация номера ----------
+# ---------- phone ----------
 
 PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 
 def normalize_phone(raw: str) -> Optional[str]:
-    """
-    E.164 (+<digits>).
-    - пробелы/дефисы/скобки убираем
-    - '8XXXXXXXXXX' (РФ) -> '+7XXXXXXXXXX'
-    - нет '+' -> ставим '+'
-    """
     s = re.sub(r"[\s\-\(\)]", "", raw.strip())
     if not s.startswith("+"):
         if s.startswith("8") and len(s) == 11:
@@ -74,8 +74,6 @@ class Auth(StatesGroup):
     code  = State()
     twofa = State()
 
-
-# ---------- aiogram ----------
 
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
@@ -159,7 +157,7 @@ async def step_code(msg: Message, state: FSMContext):
     if not (4 <= len(code) <= 7):
         return await msg.answer("Код — только цифры, 4–7 знаков.")
 
-    cli = CLIENTS.get(msg.chat.id)
+    cli   = CLIENTS.get(msg.chat.id)
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
@@ -196,7 +194,7 @@ async def step_code(msg: Message, state: FSMContext):
 async def step_2fa(msg: Message, state: FSMContext):
     if not allowed(msg):
         return
-    cli = CLIENTS.get(msg.chat.id)
+    cli   = CLIENTS.get(msg.chat.id)
     phone = PHONES.get(msg.chat.id)
     if not cli or not phone:
         await state.clear()
@@ -206,7 +204,6 @@ async def step_2fa(msg: Message, state: FSMContext):
         await cli.sign_in(password=msg.text or "")
         me = await cli.get_me()
         await state.clear()
-        # удалить сообщение с паролем из чата с ботом
         try:
             await msg.delete()
         except Exception:
@@ -232,7 +229,7 @@ async def fallback(msg: Message):
 
 
 async def main():
-    logging.info("auth-bot (aiogram) up")
+    logging.info("auth-bot up on Railway")
     await dp.start_polling(bot)
 
 
