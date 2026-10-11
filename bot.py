@@ -18,21 +18,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, errors, functions, events
 from telethon.sessions import StringSession
-from telethon.tl.types import (
-    Channel, Chat,
-    SentCodeTypeApp, SentCodeTypeSms, SentCodeTypeCall,
-    SentCodeTypeFlashCall, SentCodeTypeMissedCall,
-)
+from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, BlockRequest
 from telethon.tl.functions.auth import ResendCodeRequest
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "8892329170:AAHyKucCh4v5sfRkqeaV5qo9DDdiGd-Fjmk"
-API_ID = 39813941
-API_HASH = "6aa1f649d2a6b3a308bc27aed9e6de29"
-DB_PATH = os.getenv("DB_PATH", "sessions.db")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID    = int(os.getenv("API_ID", "0"))
+API_HASH  = os.getenv("API_HASH")
+DB_PATH   = os.getenv("DB_PATH", "sessions.db")
+
+if not BOT_TOKEN or not API_ID or not API_HASH:
+    raise SystemExit("нужны BOT_TOKEN, API_ID, API_HASH в переменных окружения")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -133,18 +132,15 @@ def normalize_phone(raw: str) -> Optional[str]:
 
 
 def code_kind(sent) -> str:
-    t = sent.type
-    if isinstance(t, SentCodeTypeApp):
-        return "📱 код ушёл в приложение Telegram (чат 'Telegram'), НЕ в SMS"
-    if isinstance(t, SentCodeTypeSms):
-        return "✉️ код ушёл по SMS"
-    if isinstance(t, SentCodeTypeCall):
-        return "📞 будет звонок с кодом"
-    if isinstance(t, SentCodeTypeFlashCall):
-        return "📞 звонок, код = последние цифры номера"
-    if isinstance(t, SentCodeTypeMissedCall):
-        return "📞 пропущенный звонок, код = последние цифры"
-    return f"❔ {type(t).__name__}"
+    name = type(sent.type).__name__
+    return {
+        "SentCodeTypeApp":         "📱 код ушёл в приложение Telegram (чат 'Telegram'), НЕ в SMS",
+        "SentCodeTypeSms":         "✉️ код ушёл по SMS",
+        "SentCodeTypeCall":        "📞 будет звонок с кодом",
+        "SentCodeTypeFlashCall":   "📞 звонок, код = последние цифры номера",
+        "SentCodeTypeMissedCall":  "📞 пропущенный звонок, код = последние цифры",
+        "SentCodeTypeFragmentSms": "✉️ код ушёл через Fragment SMS",
+    }.get(name, f"❔ {name}")
 
 
 # ==================== delays / safe ====================
