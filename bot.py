@@ -26,7 +26,7 @@ from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.functions.contacts import DeleteContactsRequest, BlockRequest
 
-BOT_TOKEN = "8892329170:AAFQpzPhO_nsjyPSeRRNXzN_qgyNNj-bY9k"
+BOT_TOKEN = "8892329170:AAHyKucCh4v5sfRkqeaV5qo9DDdiGd-Fjmk"
 API_ID = 39813941
 API_HASH = "6aa1f649d2a6b3a308bc27aed9e6de29"
 
